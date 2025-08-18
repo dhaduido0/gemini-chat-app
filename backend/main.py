@@ -1,39 +1,82 @@
-from fastapi import FastAPI, Depends
+import os
+from typing import Dict
+from dotenv import load_dotenv
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.generativeai as genai
-import os
-from dotenv import load_dotenv
-from sqlalchemy.orm import Session
-from database import get_db, search_similar_questions
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import PGVector
+from langchain_core.messages import SystemMessage
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from pdf_importer import create_vector_store, CONNECTION_STRING, COLLECTION_NAME
 
 # 환경 변수 로드
 load_dotenv()
 
-# Gemini API 설정
-api_key = os.getenv('GEMINI_API_KEY')
-print(f"API 키 확인: {api_key[:10]}..." if api_key else "API 키 없음")
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel(
-    'gemini-2.5-flash',
-    system_instruction="""당신은 명지전문대학 학사 전문가입니다. 
-
-    답변 원칙:
-    1. 명지전문대학 관련 질문에 정확히 답변
-    2. 이전 대화 맥락을 기억하고 유연하게 응답
-    3. 사용자가 간단히 말해도 정확한 의미를 파악
-    4. 관련 정보가 부족해도 일반적인 학사 원칙으로 안내
-    5. 친근하고 이해하기 쉬운 말투 사용
- 
-
-    자연스러운 대화 예시:
-    - "왜?" → "이전 대화 맥락을 바탕으로 추측하여 답변"
-    - "전과" → "학과 전과" 관련 질문으로 이해
-    - "조기취업형" → "조기취업형 계약학과" 관련 질문으로 이해
-    - "총장" → "명지전문대학 총장" 관련 질문으로 이해
-
-    명지전문대학과 전혀 관련이 없는 질문에만 "죄송합니다. 명지전문대학 관련 질문에만 답변드릴 수 있습니다."라고 답변해주세요."""
+# RAG 구성 요소를 프로그램 시작 시 한 번만 초기화
+embeddings = HuggingFaceEmbeddings(
+    model_name='nlpai-lab/KURE-v1',
+    model_kwargs={'device': 'cpu'}
 )
+
+try:
+    vector_store = PGVector(
+        collection_name=COLLECTION_NAME,
+        connection_string=CONNECTION_STRING,
+        embedding_function=embeddings
+    )
+    print("Vector store loaded from PostgreSQL.")
+except Exception as e:
+    print(f"Error connecting to PostgreSQL: {e}")
+    print("Creating a new vector store...")
+    vector_store = create_vector_store()
+    if vector_store is None:
+        exit("Error: Vector store could not be created.")
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash-lite",
+    model_kwargs={
+        "system_instruction": SystemMessage(content="""당신은 명지전문대학 학사 전문가입니다. 
+        답변 원칙: 1. 명지전문대학 관련 질문에 정확히 답변합니다. 
+        2. 이전 대화 맥락을 기억하고 유연하게 응답합니다. 
+        3. 친절하고 이해하기 쉬운 말투를 사용하며, 반드시 완전한 문장으로 답변합니다. 
+        4. 참고 정보에 없는 내용은 절대 추측하거나 임의로 답변하지 않습니다. 
+        답변 규칙: - 명지전문대학과 관련 없는 질문: "죄송합니다. 명지전문대학 관련 질문에만 답변드릴 수 있습니다."라고 답변하세요.
+        - 사용자의 질문과 관련된 정보가 참고 문서에 명확하게 존재하지 않는 경우, 어떤 내용도 추론하거나 덧붙이지 말고 무조건 "죄송합니다. 해당 정보를 확인할 수 없습니다."라고 답변하세요.""")
+    }
+)
+
+retriever = vector_store.as_retriever(
+    search_type="mmr",
+    search_kwargs={
+        "k": 3,
+        "fetch_k": 5,  # MMR에서 고려할 후보 문서 수
+        "lambda_mult": 0.7,  # 다양성 vs 관련성 가중치 (0.5는 균형)
+        "score_threshold": 0.7  # 점수 임계값 (0.7은 높은 정확도를 위한 기준)
+    }
+)
+
+# 사용자 세션별 대화 체인을 저장할 딕셔너리
+chat_sessions: Dict[str, ConversationalRetrievalChain] = {}
+
+def get_or_create_chain(session_id: str) -> ConversationalRetrievalChain:
+    if session_id not in chat_sessions:
+        memory = ConversationBufferMemory(
+            memory_key="chat_history", 
+            return_messages=True,
+            output_key="answer"  # 이 부분이 필수!
+        )
+        new_chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=retriever,
+            memory=memory,
+            return_source_documents=True  # 소스 문서 반환 활성화
+        )
+        chat_sessions[session_id] = new_chain
+        print(f"새로운 세션 ID 생성: {session_id}")
+    return chat_sessions[session_id]
 
 app = FastAPI()
 
@@ -46,131 +89,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 대화 히스토리 저장 (메모리 기반)
-chat_history = {}
-
-# 요청/응답 모델
 class ChatMessage(BaseModel):
     message: str
-    session_id: str = "default"  # 세션 구분용
+    session_id: str
 
 class ChatResponse(BaseModel):
     response: str
     success: bool
-
-def get_chat_context(session_id: str, current_message: str) -> str:
-    """대화 히스토리를 바탕으로 맥락 구성"""
-    if session_id not in chat_history:
-        return current_message
     
-    # 최근 3개 대화만 사용 (맥락 유지하면서 메모리 절약)
-    recent_history = chat_history[session_id][-3:]
-    context = ""
-    
-    for msg in recent_history:
-        context += f"사용자: {msg['user']}\n"
-        context += f"챗봇: {msg['bot']}\n"
-    
-    context += f"사용자: {current_message}\n"
-    return context
-
-def update_chat_history(session_id: str, user_message: str, bot_response: str):
-    """대화 히스토리 업데이트"""
-    if session_id not in chat_history:
-        chat_history[session_id] = []
-    
-    chat_history[session_id].append({
-        'user': user_message,
-        'bot': bot_response
-    })
-    
-    # 히스토리가 너무 길어지면 오래된 것부터 삭제 (최대 10개 유지)
-    if len(chat_history[session_id]) > 10:
-        chat_history[session_id] = chat_history[session_id][-10:]
-
-
-
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat_with_gemini(request: ChatMessage, db: Session = Depends(get_db)):
+async def chat_with_gemini(request: ChatMessage):
     try:
-        print(f"받은 메시지: {request.message}")
+        qa_chain = get_or_create_chain(request.session_id)
+        result = qa_chain.invoke({"question": request.message})
         
-        # 대화 맥락 구성
-        chat_context = get_chat_context(request.session_id, request.message)
-        print(f"대화 맥락 길이: {len(chat_context)} 문자")
-        
-        # RAG: PostgreSQL에서 유사한 질문 검색 (현재 질문만)
-        similar_questions = search_similar_questions(db, request.message, top_k=3)
-        print(f"검색된 질문 수: {len(similar_questions)}")
-        
-        # 검색된 정보 구성
-        relevant_knowledge = ""
-        if similar_questions:
-            relevant_knowledge = "참고할 수 있는 학사 정보:\n\n"
-            for i, item in enumerate(similar_questions, 1):
-                relevant_knowledge += f"{i}. 질문: {item.question}\n답변: {item.answer}\n\n"
-            print(f"관련 정보 있음: {len(relevant_knowledge)} 문자")
+        # MMR로 뽑힌 문서들 로그 출력
+        if 'source_documents' in result:
+            print(f"\n=== MMR 검색 결과 (질문: {request.message}) ===")
+            print(f"총 {len(result['source_documents'])}개 문서 선택됨")
+            for i, doc in enumerate(result['source_documents'], 1):
+                print(f"\n📄 문서 {i}:")
+                print(f"   내용: {doc.page_content[:200]}...")  # 처음 200자만 출력
+                if hasattr(doc, 'metadata'):
+                    print(f"   메타데이터: {doc.metadata}")
+                print("-" * 50)
         else:
-            print("관련 정보 없음")
+            print("⚠️ 소스 문서 정보가 없습니다.")
         
-        # 사용자 메시지에 RAG 정보 추가
-        if relevant_knowledge:
-            enhanced_message = f"""참고 정보:
-{relevant_knowledge}
-
-대화 맥락:
-{chat_context}
-
-현재 질문: {request.message}
-
-위 참고 정보를 바탕으로 명지전문대학에 대해 정확하고 친근하게 답변해주세요. 
-참고 정보에 정확한 답변이 없다면, 일반적인 학사 원칙을 안내해주세요."""
-        else:
-            enhanced_message = f"""대화 맥락:
-{chat_context}
-
-현재 질문: {request.message}
-
-이 질문이 명지전문대학과 관련이 있다면, 이전 대화 맥락을 고려하여 답변해주세요.
-예를 들어 "전과"에 대해 물어보면 일반적인 전과 절차를, "총장"에 대해 물어보면 대학 총장의 역할을 설명해주세요.
-
-만약 질문이 너무 간단하거나 맥락이 불분명하다면 (예: "왜?", "어떻게?"), 
-이전 대화 맥락을 바탕으로 추측하여 답변해주세요.
-
-명지전문대학과 전혀 관련이 없다면 "죄송합니다. 명지전문대학 관련 질문에만 답변드릴 수 있습니다."라고 답변해주세요."""
-
-        print(f"Gemini에 전달할 메시지 길이: {len(enhanced_message)} 문자")
-        
-        # 메시지가 너무 길면 잘라내기
-        if len(enhanced_message) > 8000:
-            enhanced_message = enhanced_message[:8000] + "..."
-            print(f"메시지가 너무 길어서 잘랐습니다: {len(enhanced_message)} 문자")
-
-        # Gemini API 호출
-        try:
-            # 자연스러운 대화를 위한 설정
-            response = model.generate_content(
-                enhanced_message,
-               generation_config={
-    "temperature": 0.4,      # 정확성 중시
-    "top_p": 0.8,           # 적당한 다양성
-    "max_output_tokens": 2500  # 충분한 설명
-}
-            )
-            
-            print(f"Gemini 응답: {response.text if response.text else '응답 없음'}")
-            
-            if response.text:
-                # 대화 히스토리 업데이트
-                update_chat_history(request.session_id, request.message, response.text)
-                return ChatResponse(response=response.text, success=True)
-            else:
-                return ChatResponse(response="죄송합니다. 응답을 생성할 수 없습니다.", success=False)
-                
-        except Exception as e:
-            print(f"Gemini API 오류: {str(e)}")
-            return ChatResponse(response=f"Gemini API 오류: {str(e)}", success=False)
-            
+        return ChatResponse(
+            response=result['answer'],
+            success=True
+        )
     except Exception as e:
         print(f"오류 발생: {str(e)}")
         return ChatResponse(
@@ -184,4 +133,4 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    uvicorn.run(app, host="0.0.0.0", port=8000)
