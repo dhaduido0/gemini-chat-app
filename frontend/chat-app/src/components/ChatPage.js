@@ -3,6 +3,7 @@ import './ChatPage.css';
 
 const API_BASE_URL = 'http://localhost:8000';
 
+
 function ChatPage() {
     const [messages, setMessages] = useState([]);
     const [inputMessage, setInputMessage] = useState('');
@@ -125,6 +126,15 @@ function ChatPage() {
                         key={index}
                         className={`message ${message.role === 'user' ? 'user-message' : 'ai-message'}`}
                     >
+                        {message.role === 'ai' && (
+                            <div className="ai-avatar">
+                                <img 
+                                    src="/mjc-logo.png" 
+                                    alt="MJC AI" 
+                                    className="avatar-image"
+                                />
+                            </div>
+                        )}
                         <div className="message-content">
                             <div className="message-text">{message.content}</div>
                             <div className="message-time">
@@ -135,6 +145,13 @@ function ChatPage() {
                 ))}
                 {isLoading && (
                     <div className="message ai-message">
+                        <div className="ai-avatar">
+                            <img 
+                                src="/mjc-logo.png" 
+                                alt="MJC AI" 
+                                className="avatar-image"
+                            />
+                        </div>
                         <div className="message-content">
                             <div className="typing-indicator">
                                 <div className="typing-dot"></div>
